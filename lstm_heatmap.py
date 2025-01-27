@@ -11,6 +11,8 @@ from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler
 from keras.models import Sequential
 from keras.layers import LSTM, Dense, Input
+import keras_tuner as kt
+import tensorflow as tf
 import matplotlib.pyplot as plt
 
 # Load and preprocess data
@@ -34,28 +36,32 @@ def create_sequences(data, sequence_length):
         y.append(data[i+sequence_length])
     return np.array(X), np.array(y)
 
-# Build the LSTM model dynamically based on hyperparameters
-def build_lstm_model(sequence_length, neurons, layers):
+# Define the model-building function for Keras Tuner
+def build_model(hp):
     model = Sequential()
-    # Add an explicit input layer
-    model.add(Input(shape=(sequence_length, 1)))
+    model.add(Input(shape=(50, 1)))  # Input shape for sequences of length 50
     
-    # Add LSTM layers
-    for i in range(layers):
-        if i == layers - 1:
-            # Last LSTM layer should not return sequences
-            model.add(LSTM(neurons, return_sequences=False))
-        else:
-            # Intermediate LSTM layers return sequences
-            model.add(LSTM(neurons, return_sequences=True))
+    # Add LSTM layers with tunable number of neurons and layers
+    for i in range(hp.Int('num_layers', 1, 3)):  # 1 to 3 layers
+        model.add(LSTM(
+            units=hp.Int('units_' + str(i), min_value=32, max_value=256, step=32),  # Tunable neurons per layer
+            return_sequences=(i < hp.Int('num_layers', 1, 3) - 1)  # Return sequences for all but the last layer
+        ))
     
-    # Add a Dense layer for output
+    # Add Dense output layer
     model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mean_squared_error')
+    
+    # Compile model with tunable learning rate
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=hp.Choice('learning_rate', [1e-2, 1e-3, 1e-4])  # Tunable learning rate
+        ),
+        loss='mean_squared_error'
+    )
     return model
 
-# Train and evaluate the model
-def train_and_evaluate_lstm_model(file_path, epochs, neurons, layers):
+# Train and evaluate the model using Keras Tuner
+def train_with_keras_tuner(file_path, max_trials=10, executions_per_trial=1):
     data, scaled_data, scaler = load_and_preprocess_data(file_path)
     
     # Create sequences
@@ -67,17 +73,50 @@ def train_and_evaluate_lstm_model(file_path, epochs, neurons, layers):
     X_train, X_test = X[:train_size], X[train_size:]
     y_train, y_test = y[:train_size], y[train_size:]
     
-    # Build and train the model
-    model = build_lstm_model(sequence_length, neurons, layers)
-    history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=epochs, batch_size=32, verbose=0)
+    # Create a tuner instance
+    tuner = kt.RandomSearch(
+        build_model,
+        objective='val_loss',
+        max_trials=max_trials,  # Number of hyperparameter combinations to try
+        executions_per_trial=executions_per_trial,  # Average results over multiple runs
+        directory='tuner_results',
+        project_name='lstm_hyperparameter_tuning'
+    )
     
-    # Evaluate the model
-    predictions = model.predict(X_test)
-    predictions = scaler.inverse_transform(predictions)  # Unscale the predictions
-    y_test_rescaled = scaler.inverse_transform(y_test.reshape(-1, 1))  # Unscale the actual values
+    # Search for the best hyperparameters
+    tuner.search(
+        X_train, y_train,
+        validation_data=(X_test, y_test),
+        epochs=10,  # Number of epochs for each trial
+        batch_size=32,
+        callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3)]
+    )
+    
+    # Get the best hyperparameters and model
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    print(f"Best number of layers: {best_hps.get('num_layers')}")
+    for i in range(best_hps.get('num_layers')):
+        print(f"Best units for layer {i}: {best_hps.get('units_' + str(i))}")
+    print(f"Best learning rate: {best_hps.get('learning_rate')}")
+    
+    # Train the best model
+    best_model = tuner.hypermodel.build(best_hps)
+    history = best_model.fit(
+        X_train, y_train,
+        validation_data=(X_test, y_test),
+        epochs=50,
+        batch_size=32,
+        callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5)]
+    )
+    
+    # Evaluate the best model
+    predictions = best_model.predict(X_test)
+    predictions = scaler.inverse_transform(predictions)  # Unscale predictions
+    y_test_rescaled = scaler.inverse_transform(y_test.reshape(-1, 1))  # Unscale actual values
     
     # Calculate RMSE
     rmse = np.sqrt(np.mean((y_test_rescaled - predictions) ** 2))
+    print(f"RMSE: {rmse}")
     
     # Save predictions and actual values to CSV
     guess_data = pd.DataFrame({'ds': data['timestamp'].iloc[-len(y_test):].values, 'yhat': predictions.flatten()})
@@ -85,38 +124,11 @@ def train_and_evaluate_lstm_model(file_path, epochs, neurons, layers):
     guess_data.to_csv('guess_data.csv', index=False)
     eval_data.to_csv('eval_data.csv', index=False)
     
-    # Save graphs
-    # output_image_path = f"predictions_lstm_epochs_{epochs}_neurons_{neurons}_layers_{layers}.png"
-    # plt.figure(figsize=(12, 6))
-    # plt.plot(data['timestamp'].iloc[-len(y_test):], y_test_rescaled, label='Real value')
-    # plt.plot(data['timestamp'].iloc[-len(y_test):], predictions, label='Predictions', alpha=0.7)
-    # plt.xlabel('Time')
-    # plt.ylabel('Value')
-    # plt.legend()
-    # plt.savefig(output_image_path)
-    # plt.close()
+    return history, rmse
 
-    return rmse
-
-# Example: Hyperparameter tuning
+# Example: Train and tune with Keras Tuner
 if __name__ == "__main__":
-    # Define ranges for hyperparameters
     file_path = "data.csv"
-    epochs_range = range(5, 31, 5)  # 5 to 30, step 5
-    neurons_range = range(10, 51, 10)  # 10 to 50, step 10
-    layers_range = range(1, 4)  # 1 to 3
-    print("About to start!")
-    results = []
-    
-    for epochs in epochs_range:
-        for neurons in neurons_range:
-            for layers in layers_range:
-                print(f"Training with epochs={epochs}, neurons={neurons}, layers={layers}...")
-                rmse = train_and_evaluate_lstm_model(file_path, epochs, neurons, layers)
-                results.append([rmse, epochs, neurons, layers])
-                print(f"RMSE: {rmse}")
-    
-    # Save results to CSV
-    results_df = pd.DataFrame(results, columns=['RMSE', 'Epochs', 'Neurons', 'Layers'])
-    results_df.to_csv('hyperparameter_search_results.csv', index=False)
-    print("Results saved to hyperparameter_search_results.csv")
+    print("Starting hyperparameter tuning...")
+    history, rmse = train_with_keras_tuner(file_path)
+    print(f"Tuning complete. Best model RMSE: {rmse}")
